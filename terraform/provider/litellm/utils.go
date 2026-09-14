@@ -203,40 +203,23 @@ func isCredentialNotFoundError(errResp ErrorResponse) bool {
 	return false
 }
 
-// errCredentialConflict signals that a credential of that name already exists.
-// Sentinel rather than a bare string so callers can use errors.Is; its message
-// is unchanged so existing string comparisons keep working.
 var errCredentialConflict = errors.New("credential_conflict")
 
-// isCredentialConflictError checks if the error response indicates a credential
-// name collision. Proxies from v1.87.2 return a 409 handled by status code in
-// handleCredentialAPIResponse; this string matching is the fallback for older
-// proxies, which surface the conflict as a 500 carrying the underlying Prisma
-// unique-constraint message on credential_name. See
-// https://github.com/BerriAI/terraform-provider-litellm/issues/8.
+// Proxies older than 1.102.0 report a taken name as a 500 carrying Prisma's
+// unique-constraint message instead of a 409.
 func isCredentialConflictError(errResp ErrorResponse) bool {
-	if msg, ok := errResp.Error.Message.(string); ok {
-		if strings.Contains(msg, "Unique constraint failed") && strings.Contains(msg, "credential_name") {
-			return true
-		}
+	isConflict := func(msg string) bool {
+		return strings.Contains(msg, "Unique constraint failed") && strings.Contains(msg, "credential_name")
 	}
-
+	if msg, ok := errResp.Error.Message.(string); ok && isConflict(msg) {
+		return true
+	}
 	if msgMap, ok := errResp.Error.Message.(map[string]interface{}); ok {
-		if errStr, ok := msgMap["error"].(string); ok {
-			if strings.Contains(errStr, "Unique constraint failed") && strings.Contains(errStr, "credential_name") {
-				return true
-			}
-		}
-	}
-
-	// Check Detail.Error field for LiteLLM proxy error format
-	if errResp.Detail.Error != "" {
-		if strings.Contains(errResp.Detail.Error, "Unique constraint failed") && strings.Contains(errResp.Detail.Error, "credential_name") {
+		if errStr, ok := msgMap["error"].(string); ok && isConflict(errStr) {
 			return true
 		}
 	}
-
-	return false
+	return isConflict(errResp.Detail.Error)
 }
 
 // handleCredentialAPIResponse handles API responses specifically for credential operations

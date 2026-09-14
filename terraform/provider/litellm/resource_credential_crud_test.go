@@ -1,6 +1,7 @@
 package litellm
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/terraform"
 )
 
 // newTestResourceData creates a *schema.ResourceData with the credential schema,
@@ -202,10 +204,6 @@ func TestRetryCredentialRead_ConnectionError(t *testing.T) {
 	fmt.Printf("connection error (expected): %v\n", err)
 }
 
-// conflictBody is how a proxy reports that the credential name is taken.
-// modernConflictBody is the typed 409 added in https://github.com/BerriAI/litellm/pull/39745;
-// legacyConflictBody is what older proxies return, a 500 leaking the Prisma
-// unique-constraint message, which the provider must still recognize.
 type conflictBody struct {
 	status int
 	body   string
@@ -222,11 +220,14 @@ var (
 	}
 )
 
-// conflictServer builds the shared conflict-then-recover mock used by the
-// adoption tests below. conflict controls how the POST reports the name
-// collision and patchStatus/patchBody control the PATCH response, so callers
-// can exercise both proxy generations and both the success and failure paths.
-func conflictServer(t *testing.T, conflict conflictBody, patchStatus int, patchBody string) (*httptest.Server, *int32, *int32, *[]byte) {
+type conflictServerOptions struct {
+	conflict    conflictBody
+	patchStatus int
+	patchBody   string
+	getStatus   int
+}
+
+func conflictServer(t *testing.T, opts conflictServerOptions) (*httptest.Server, *int32, *int32, *[]byte) {
 	t.Helper()
 	var createCalls, patchCalls int32
 	var capturedPatchBody []byte
@@ -235,8 +236,8 @@ func conflictServer(t *testing.T, conflict conflictBody, patchStatus int, patchB
 		case r.Method == http.MethodPost && r.URL.Path == "/credentials":
 			atomic.AddInt32(&createCalls, 1)
 			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(conflict.status)
-			w.Write([]byte(conflict.body))
+			w.WriteHeader(opts.conflict.status)
+			w.Write([]byte(opts.conflict.body))
 		case r.Method == http.MethodPatch:
 			atomic.AddInt32(&patchCalls, 1)
 			if r.URL.Path != "/credentials/conflict-test" {
@@ -245,11 +246,16 @@ func conflictServer(t *testing.T, conflict conflictBody, patchStatus int, patchB
 			body, _ := io.ReadAll(r.Body)
 			capturedPatchBody = body
 			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(patchStatus)
-			w.Write([]byte(patchBody))
+			w.WriteHeader(opts.patchStatus)
+			w.Write([]byte(opts.patchBody))
 		case r.Method == http.MethodGet:
 			if r.URL.Path != "/credentials/by_name/conflict-test" || r.URL.Query().Get("model_id") != "model-1" {
 				t.Errorf("GET went to %q (query %q), want /credentials/by_name/conflict-test?model_id=model-1", r.URL.Path, r.URL.RawQuery)
+			}
+			if opts.getStatus != 0 && opts.getStatus != http.StatusOK {
+				w.WriteHeader(opts.getStatus)
+				w.Write([]byte(`{"error":{"message":"Internal Server Error"}}`))
+				return
 			}
 			resp := CredentialResponse{CredentialName: "conflict-test", CredentialInfo: map[string]interface{}{}}
 			body, _ := json.Marshal(resp)
@@ -274,10 +280,6 @@ func adoptTestData(t *testing.T, adoptExisting bool) *schema.ResourceData {
 	})
 }
 
-// With adopt_existing set, a credential that already exists in LiteLLM (created
-// out of band, or left behind by a prior apply that dropped state) is adopted on
-// create instead of failing, and the adopt PATCH must carry model_id so
-// model-based credential resolution still applies.
 func TestResourceLiteLLMCredentialCreate_AdoptsOnConflictWhenOptedIn(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
@@ -287,7 +289,7 @@ func TestResourceLiteLLMCredentialCreate_AdoptsOnConflictWhenOptedIn(t *testing.
 		{"legacy 500 with unique-constraint message", legacyConflictBody},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			srv, createCalls, patchCalls, patchBody := conflictServer(t, tc.conflict, http.StatusOK, `{}`)
+			srv, createCalls, patchCalls, patchBody := conflictServer(t, conflictServerOptions{conflict: tc.conflict, patchStatus: http.StatusOK, patchBody: `{}`})
 			defer srv.Close()
 
 			client := NewClient(srv.URL, "test-key", true)
@@ -324,10 +326,6 @@ func TestResourceLiteLLMCredentialCreate_AdoptsOnConflictWhenOptedIn(t *testing.
 	}
 }
 
-// Without adopt_existing, create must refuse to seize a credential this
-// configuration never made: no PATCH, no resource ID, and an error that names
-// the import command that adopts it explicitly plus the flag that opts into
-// taking it over.
 func TestResourceLiteLLMCredentialCreate_ConflictWithoutOptInFailsWithImportHint(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
@@ -337,7 +335,7 @@ func TestResourceLiteLLMCredentialCreate_ConflictWithoutOptInFailsWithImportHint
 		{"legacy 500 with unique-constraint message", legacyConflictBody},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			srv, createCalls, patchCalls, _ := conflictServer(t, tc.conflict, http.StatusOK, `{}`)
+			srv, createCalls, patchCalls, _ := conflictServer(t, conflictServerOptions{conflict: tc.conflict, patchStatus: http.StatusOK, patchBody: `{}`})
 			defer srv.Close()
 
 			client := NewClient(srv.URL, "test-key", true)
@@ -358,8 +356,7 @@ func TestResourceLiteLLMCredentialCreate_ConflictWithoutOptInFailsWithImportHint
 			}
 			for _, want := range []string{
 				"already exists",
-				"terraform import litellm_credential.",
-				"conflict-test",
+				`terraform import litellm_credential.<this resource's name in your config> "conflict-test"`,
 				"adopt_existing = true",
 			} {
 				if !strings.Contains(err.Error(), want) {
@@ -370,11 +367,12 @@ func TestResourceLiteLLMCredentialCreate_ConflictWithoutOptInFailsWithImportHint
 	}
 }
 
-// If the adopt PATCH itself fails, create must not have set the resource ID
-// for a credential this run doesn't own - otherwise Terraform taints the
-// entry and the *next* apply destroys a credential nobody here created.
 func TestResourceLiteLLMCredentialCreate_FailedAdoptDoesNotTaint(t *testing.T) {
-	srv, createCalls, patchCalls, _ := conflictServer(t, modernConflictBody, http.StatusInternalServerError, `{"error":{"message":"Internal Server Error"}}`)
+	srv, createCalls, patchCalls, _ := conflictServer(t, conflictServerOptions{
+		conflict:    modernConflictBody,
+		patchStatus: http.StatusInternalServerError,
+		patchBody:   `{"error":{"message":"Internal Server Error"}}`,
+	})
 	defer srv.Close()
 
 	client := NewClient(srv.URL, "test-key", true)
@@ -395,8 +393,6 @@ func TestResourceLiteLLMCredentialCreate_FailedAdoptDoesNotTaint(t *testing.T) {
 	}
 }
 
-// A non-conflict failure (a plain 500, for example) must return the original
-// error and never attempt to adopt anything, even with adopt_existing set.
 func TestResourceLiteLLMCredentialCreate_NonConflictErrorDoesNotAdopt(t *testing.T) {
 	var createCalls, patchCalls int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -433,5 +429,161 @@ func TestResourceLiteLLMCredentialCreate_NonConflictErrorDoesNotAdopt(t *testing
 	}
 	if d.Id() != "" {
 		t.Fatalf("resource ID must stay empty on a non-conflict failure, got %q", d.Id())
+	}
+}
+
+func TestResourceLiteLLMCredentialCreate_AdoptKeepsIDWhenPostPatchReadFails(t *testing.T) {
+	srv, _, patchCalls, _ := conflictServer(t, conflictServerOptions{
+		conflict:    modernConflictBody,
+		patchStatus: http.StatusOK,
+		patchBody:   `{}`,
+		getStatus:   http.StatusInternalServerError,
+	})
+	defer srv.Close()
+
+	client := NewClient(srv.URL, "test-key", true)
+	d := adoptTestData(t, true)
+
+	err := resourceLiteLLMCredentialCreate(d, client)
+	if err == nil {
+		t.Fatal("expected the failed post-adopt read to surface as an error, got nil")
+	}
+	if got := atomic.LoadInt32(patchCalls); got != 1 {
+		t.Fatalf("expected exactly 1 PATCH, got %d", got)
+	}
+	if d.Id() != "conflict-test" {
+		t.Fatalf("the PATCH already overwrote the remote credential, so the ID must stay set for Terraform to track it; got %q", d.Id())
+	}
+}
+
+func TestResourceLiteLLMCredentialImportHintQuotesTheName(t *testing.T) {
+	spaced := conflictBody{
+		status: http.StatusConflict,
+		body:   `{"error":{"message":"Credential 'my cred' already exists.","code":"409"}}`,
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(spaced.status)
+		w.Write([]byte(spaced.body))
+	}))
+	defer srv.Close()
+
+	d := schema.TestResourceDataRaw(t, resourceLiteLLMCredential().Schema, map[string]interface{}{
+		"credential_name":   "my cred",
+		"credential_info":   map[string]interface{}{},
+		"credential_values": map[string]interface{}{"key": "val"},
+	})
+
+	err := resourceLiteLLMCredentialCreate(d, NewClient(srv.URL, "test-key", true))
+	if err == nil {
+		t.Fatal("expected the conflict to fail create, got nil")
+	}
+	if want := `terraform import litellm_credential.<this resource's name in your config> "my cred"`; !strings.Contains(err.Error(), want) {
+		t.Fatalf("import hint must quote a name with spaces; missing %q in: %v", want, err)
+	}
+}
+
+func TestCredentialRequestsEscapeReservedCharactersInTheName(t *testing.T) {
+	const name = "team/a?b c"
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.Method+" "+r.URL.EscapedPath()+"?"+r.URL.RawQuery)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"credential_name":"` + name + `","credential_info":{}}`))
+	}))
+	defer srv.Close()
+
+	client := NewClient(srv.URL, "test-key", true)
+	d := schema.TestResourceDataRaw(t, resourceLiteLLMCredential().Schema, map[string]interface{}{
+		"credential_name":   name,
+		"model_id":          "m&1",
+		"credential_info":   map[string]interface{}{},
+		"credential_values": map[string]interface{}{"key": "val"},
+	})
+	d.SetId(name)
+
+	if err := resourceLiteLLMCredentialRead(d, client); err != nil {
+		t.Fatalf("read failed: %v", err)
+	}
+	if err := patchCredential(client, d, name); err != nil {
+		t.Fatalf("patch failed: %v", err)
+	}
+	if err := resourceLiteLLMCredentialDelete(d, client); err != nil {
+		t.Fatalf("delete failed: %v", err)
+	}
+
+	want := []string{
+		"GET /credentials/by_name/team%2Fa%3Fb%20c?model_id=m%261",
+		"PATCH /credentials/team%2Fa%3Fb%20c?",
+		"DELETE /credentials/team%2Fa%3Fb%20c?",
+	}
+	if strings.Join(paths, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("request paths:\n%s\nwant:\n%s", strings.Join(paths, "\n"), strings.Join(want, "\n"))
+	}
+}
+
+func TestResourceLiteLLMCredentialUpdate_TogglingAdoptExistingSendsNoPatch(t *testing.T) {
+	var patchCalls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPatch {
+			atomic.AddInt32(&patchCalls, 1)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"credential_name":"cred-1","credential_info":{}}`))
+	}))
+	defer srv.Close()
+
+	res := resourceLiteLLMCredential()
+	priorData := schema.TestResourceDataRaw(t, res.Schema, map[string]interface{}{
+		"credential_name":   "cred-1",
+		"credential_info":   map[string]interface{}{},
+		"credential_values": map[string]interface{}{"api_key": "sk-secret"},
+		"adopt_existing":    false,
+	})
+	priorData.SetId("cred-1")
+	prior := priorData.State()
+
+	toggled := terraform.NewResourceConfigRaw(map[string]interface{}{
+		"credential_name":   "cred-1",
+		"credential_info":   map[string]interface{}{},
+		"credential_values": map[string]interface{}{"api_key": "sk-secret"},
+		"adopt_existing":    true,
+	})
+	diff, err := res.Diff(context.Background(), prior, toggled, nil)
+	if err != nil {
+		t.Fatalf("diff failed: %v", err)
+	}
+	d, err := schema.InternalMap(res.Schema).Data(prior, diff)
+	if err != nil {
+		t.Fatalf("data failed: %v", err)
+	}
+	if err := resourceLiteLLMCredentialUpdate(d, NewClient(srv.URL, "test-key", true)); err != nil {
+		t.Fatalf("update failed: %v", err)
+	}
+	if got := atomic.LoadInt32(&patchCalls); got != 0 {
+		t.Fatalf("flipping adopt_existing alone must not rewrite the credential's secrets; got %d PATCH calls", got)
+	}
+
+	rotated := terraform.NewResourceConfigRaw(map[string]interface{}{
+		"credential_name":   "cred-1",
+		"credential_info":   map[string]interface{}{},
+		"credential_values": map[string]interface{}{"api_key": "sk-rotated"},
+		"adopt_existing":    true,
+	})
+	diff, err = res.Diff(context.Background(), prior, rotated, nil)
+	if err != nil {
+		t.Fatalf("diff failed: %v", err)
+	}
+	d, err = schema.InternalMap(res.Schema).Data(prior, diff)
+	if err != nil {
+		t.Fatalf("data failed: %v", err)
+	}
+	if err := resourceLiteLLMCredentialUpdate(d, NewClient(srv.URL, "test-key", true)); err != nil {
+		t.Fatalf("update failed: %v", err)
+	}
+	if got := atomic.LoadInt32(&patchCalls); got != 1 {
+		t.Fatalf("a real value change must still PATCH; got %d PATCH calls", got)
 	}
 }

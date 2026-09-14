@@ -1,5 +1,6 @@
 """Tests for the credential management endpoints."""
 
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -122,7 +123,9 @@ def test_delete_credential_answers_404_when_the_credential_does_not_exist(creden
 
     response = _delete_credential("definitely-not-there")
 
-    assert response.status_code == 404, f"delete of a missing credential answered {response.status_code}: {response.text}"
+    assert response.status_code == 404, (
+        f"delete of a missing credential answered {response.status_code}: {response.text}"
+    )
     assert "definitely-not-there" in response.text
 
 
@@ -201,19 +204,15 @@ def _create_credential(body: dict):
     return _call_as_admin("POST", "/credentials", body)
 
 
+class _UniqueViolation(Exception):
+    code = "P2002"
+
+
 def test_create_credential_answers_409_when_the_name_is_already_taken(credential_store):
-    """Regression: create used to let the insert hit the unique index and surface Prisma's
-    ``Unique constraint failed on the fields: (credential_name)`` as a 500, so every caller
-    had to string-match that message to tell a name collision from a real server fault. The
-    Terraform provider did exactly that. A taken name is the caller's mistake, so it answers
-    409 and names the route that updates the existing credential."""
-    stored = CredentialItem(
-        credential_name="aws_bedrock",
-        credential_values={"aws_access_key_id": "old"},
-        credential_info={"custom_llm_provider": "bedrock"},
+    """Regression: the unique index used to surface as a Prisma 500 that callers string-matched."""
+    credential_store(
+        create=AsyncMock(side_effect=_UniqueViolation("Unique constraint failed on the fields: (`credential_name`)")),
     )
-    create = AsyncMock()
-    credential_store(find_by_name=AsyncMock(return_value=stored), create=create)
 
     response = _create_credential(
         {"credential_name": "aws_bedrock", "credential_values": {"aws_access_key_id": "new"}, "credential_info": {}},
@@ -222,41 +221,13 @@ def test_create_credential_answers_409_when_the_name_is_already_taken(credential
     assert response.status_code == 409, f"name collision answered {response.status_code}: {response.text}"
     message = response.json()["error"]["message"]
     assert message == (
-        "Credential 'aws_bedrock' already exists. "
-        "Update it with PATCH /credentials/aws_bedrock, or delete it first."
+        "Credential 'aws_bedrock' already exists. Update it with PATCH /credentials/aws_bedrock, or delete it first."
     ), f"the operator reads this message verbatim: {message}"
-    assert "Unique constraint" not in response.text, f"the Prisma internals must not leak: {response.text}"
-    create.assert_not_awaited(), "the guard must reject before writing"
-
-
-def test_create_credential_answers_409_when_a_concurrent_create_wins_the_race(credential_store):
-    """The existence check above is advisory: two creates of the same name can both pass it,
-    and the loser's insert is what the unique index rejects. That loser must answer the same
-    409 as the guard rather than falling through to a 500."""
-
-    class _UniqueViolation(Exception):
-        code = "P2002"
-
-    credential_store(
-        find_by_name=AsyncMock(return_value=None),
-        create=AsyncMock(side_effect=_UniqueViolation("Unique constraint failed on the fields: (`credential_name`)")),
-    )
-
-    response = _create_credential(
-        {"credential_name": "aws_bedrock", "credential_values": {"aws_access_key_id": "new"}, "credential_info": {}},
-    )
-
-    assert response.status_code == 409, f"the losing racer answered {response.status_code}: {response.text}"
     assert "Unique constraint" not in response.text, f"the Prisma internals must not leak: {response.text}"
 
 
 def test_create_credential_still_answers_500_when_the_write_fails_for_another_reason(credential_store):
-    """Only a unique-index collision becomes a 409; a genuine database fault must stay a 500
-    so it is not mistaken for a caller error and quietly retried as an update."""
-    credential_store(
-        find_by_name=AsyncMock(return_value=None),
-        create=AsyncMock(side_effect=Exception("connection reset by peer")),
-    )
+    credential_store(create=AsyncMock(side_effect=Exception("connection reset by peer")))
 
     response = _create_credential(
         {"credential_name": "aws_bedrock", "credential_values": {"aws_access_key_id": "new"}, "credential_info": {}},
@@ -266,8 +237,8 @@ def test_create_credential_still_answers_500_when_the_write_fails_for_another_re
 
 
 def test_create_credential_still_answers_200_for_a_name_that_is_free(credential_store):
-    """The guard must not cost the happy path: a free name still creates."""
-    credential_store(find_by_name=AsyncMock(return_value=None), create=AsyncMock(return_value=None))
+    find_by_name = AsyncMock()
+    credential_store(find_by_name=find_by_name, create=AsyncMock(return_value=None))
 
     response = _create_credential(
         {"credential_name": "brand_new", "credential_values": {"aws_access_key_id": "new"}, "credential_info": {}},
@@ -275,3 +246,68 @@ def test_create_credential_still_answers_200_for_a_name_that_is_free(credential_
 
     assert response.status_code == 200, response.text
     assert response.json()["success"] is True
+    find_by_name.assert_not_awaited(), "the unique index is the guard; create must not add a lookup"
+
+
+def test_update_credential_resolves_credential_values_from_model_id_like_create(credential_store):
+    """Regression: PATCH dropped ``model_id`` from the body, so an update that named a
+    deployment instead of raw values wrote whatever the caller sent, or nothing."""
+    stored = CredentialItem(
+        credential_name="from-deployment",
+        credential_values={"api_key": "sk-old"},
+        credential_info={},
+    )
+    update_by_name = AsyncMock(return_value=None)
+    credential_store(find_by_name=AsyncMock(return_value=stored), update_by_name=update_by_name)
+    router = MagicMock()
+    router.get_deployment.return_value = {"model_name": "gpt-5.2"}
+    router.get_deployment_credentials.return_value = {"api_key": "sk-from-deployment"}
+    patch("litellm.proxy.proxy_server.llm_router", router).start()
+
+    response = _patch_credential(
+        "from-deployment",
+        {"credential_name": "from-deployment", "model_id": "deployment-1", "credential_info": {}},
+    )
+
+    assert response.status_code == 200, response.text
+    router.get_deployment_credentials.assert_called_once_with("deployment-1")
+    written = json.loads(update_by_name.await_args.kwargs["data"]["credential_values"])
+    assert set(written) == {"api_key"}
+    assert written["api_key"] != "sk-old", "the deployment's values must replace the stored ones"
+    assert written["api_key"] != "sk-from-deployment", "values are encrypted before they reach the table"
+
+
+def test_update_credential_answers_404_when_model_id_names_no_deployment(credential_store):
+    stored = CredentialItem(
+        credential_name="from-deployment", credential_values={"api_key": "sk-old"}, credential_info={}
+    )
+    update_by_name = AsyncMock(return_value=None)
+    credential_store(find_by_name=AsyncMock(return_value=stored), update_by_name=update_by_name)
+    router = MagicMock()
+    router.get_deployment.return_value = None
+    patch("litellm.proxy.proxy_server.llm_router", router).start()
+
+    response = _patch_credential(
+        "from-deployment",
+        {"credential_name": "from-deployment", "model_id": "no-such-deployment", "credential_info": {}},
+    )
+
+    assert response.status_code == 404, response.text
+    update_by_name.assert_not_awaited()
+
+
+def test_update_credential_still_accepts_a_body_without_credential_values(credential_store):
+    """Renaming or re-tagging a credential sends only ``credential_info``; that must not 422."""
+    stored = CredentialItem(credential_name="existing", credential_values={"api_key": "sk-old"}, credential_info={})
+    update_by_name = AsyncMock(return_value=None)
+    credential_store(find_by_name=AsyncMock(return_value=stored), update_by_name=update_by_name)
+
+    response = _patch_credential(
+        "existing",
+        {"credential_name": "existing", "credential_info": {"custom_llm_provider": "openai"}},
+    )
+
+    assert response.status_code == 200, response.text
+    written = update_by_name.await_args.kwargs["data"]
+    assert json.loads(written["credential_info"]) == {"custom_llm_provider": "openai"}
+    assert set(json.loads(written["credential_values"])) == {"api_key"}, "stored values survive an info-only patch"

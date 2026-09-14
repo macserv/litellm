@@ -8,6 +8,7 @@ from typing import (
 )
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Request, Response
+from pydantic import TypeAdapter
 
 import litellm
 from litellm._logging import verbose_proxy_logger
@@ -19,9 +20,11 @@ from litellm.proxy.common_utils.encrypt_decrypt_utils import encrypt_value_helpe
 from litellm.proxy.utils import handle_exception_on_proxy, jsonify_object
 from litellm.repositories.base_repository import is_unique_violation
 from litellm.repositories.credentials_repository import CredentialsRepository
-from litellm.types.utils import CreateCredentialItem, CredentialItem
+from litellm.router import Router
+from litellm.types.utils import CreateCredentialItem, CredentialItem, UpdateCredentialItem
 
 router: Final = APIRouter()
+_CREDENTIAL_VALUES_ADAPTER: Final = TypeAdapter(dict[str, object])
 
 
 class CredentialHelperUtils:
@@ -48,6 +51,20 @@ def _credential_exists_detail(credential_name: str) -> str:
     )
 
 
+def _resolve_deployment_credentials(llm_router: Router | None, model_id: str) -> dict[str, object]:
+    if llm_router is None:
+        raise HTTPException(
+            status_code=500,
+            detail="LLM router not found. Please ensure you have a valid router instance.",
+        )
+    if llm_router.get_deployment(model_id) is None:
+        raise HTTPException(status_code=404, detail="Model not found")
+    credential_values: Final = llm_router.get_deployment_credentials(model_id)
+    if credential_values is None:
+        raise HTTPException(status_code=404, detail="Model not found")
+    return _CREDENTIAL_VALUES_ADAPTER.validate_python(credential_values)
+
+
 @router.post(
     "/credentials",
     dependencies=[Depends(user_api_key_auth)],
@@ -72,32 +89,19 @@ async def create_credential(
                 status_code=500,
                 detail={"error": CommonProxyErrors.db_not_connected_error.value},
             )
-        credentials_repository: Final = CredentialsRepository(prisma_client)
-        if await credentials_repository.find_by_name(credential.credential_name) is not None:
-            raise HTTPException(status_code=409, detail=_credential_exists_detail(credential.credential_name))
-        if credential.model_id:
-            if llm_router is None:
-                raise HTTPException(
-                    status_code=500,
-                    detail="LLM router not found. Please ensure you have a valid router instance.",
-                )
-            # get model from router
-            model: Final = llm_router.get_deployment(credential.model_id)
-            if model is None:
-                raise HTTPException(status_code=404, detail="Model not found")
-            credential_values: Final = llm_router.get_deployment_credentials(credential.model_id)
-            if credential_values is None:
-                raise HTTPException(status_code=404, detail="Model not found")
-            credential.credential_values = credential_values
-
-        if credential.credential_values is None:
+        credential_values: Final = (
+            _resolve_deployment_credentials(llm_router, credential.model_id)
+            if credential.model_id
+            else credential.credential_values
+        )
+        if credential_values is None:
             raise HTTPException(
                 status_code=400,
                 detail="Credential values are required. Unable to infer credential values from model ID.",
             )
         processed_credential: Final = CredentialItem(
             credential_name=credential.credential_name,
-            credential_values=credential.credential_values,
+            credential_values=credential_values,
             credential_info=credential.credential_info,
         )
         encrypted_credential: Final = CredentialHelperUtils.encrypt_credential_values(processed_credential)
@@ -106,7 +110,7 @@ async def create_credential(
             "dict[str, object]", jsonify_object(credentials_dict)
         )
         try:
-            await credentials_repository.create(
+            await CredentialsRepository(prisma_client).create(
                 data={
                     **credentials_dict_jsonified,
                     "created_by": user_api_key_dict.user_id,
@@ -316,14 +320,15 @@ def update_db_credential(
 async def update_credential(
     request: Request,
     fastapi_response: Response,
-    credential: CredentialItem,
+    credential: UpdateCredentialItem,
     credential_name: str = Path(..., description="The credential name, percent-decoded; may contain slashes"),
     user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
 ):
     """
     [BETA] endpoint. This might change unexpectedly.
+    Like create, ``model_id`` resolves ``credential_values`` from that deployment.
     """
-    from litellm.proxy.proxy_server import prisma_client
+    from litellm.proxy.proxy_server import llm_router, prisma_client
 
     try:
         if prisma_client is None:
@@ -335,7 +340,16 @@ async def update_credential(
         db_credential: Final = await credentials_repository.find_by_name(credential_name)
         if db_credential is None:
             raise HTTPException(status_code=404, detail="Credential not found in DB.")
-        merged_credential: Final = update_db_credential(db_credential, credential)
+        patch: Final = CredentialItem(
+            credential_name=credential.credential_name,
+            credential_info=credential.credential_info,
+            credential_values=(
+                _resolve_deployment_credentials(llm_router, credential.model_id)
+                if credential.model_id
+                else credential.credential_values or {}
+            ),
+        )
+        merged_credential: Final = update_db_credential(db_credential, patch)
         credential_object_jsonified: Final = cast(  # cast-ok: deep-copies a model_dump, so keys are str
             "dict[str, object]", jsonify_object(merged_credential.model_dump())
         )
@@ -357,11 +371,11 @@ async def update_credential(
 
         if existing_in_memory is not None:
             in_memory_values: Final = dict(existing_in_memory.credential_values or {})
-            if credential.credential_values:
-                in_memory_values.update(credential.credential_values)
+            if patch.credential_values:
+                in_memory_values.update(patch.credential_values)
             in_memory_info: Final = dict(existing_in_memory.credential_info or {})
-            if credential.credential_info:
-                in_memory_info.update(credential.credential_info)
+            if patch.credential_info:
+                in_memory_info.update(patch.credential_info)
             updated_in_memory: Final = CredentialItem(
                 credential_name=new_name,
                 credential_values=in_memory_values,

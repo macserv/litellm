@@ -4263,6 +4263,7 @@ from litellm.models.credentials import (  # noqa: E402
 )
 from litellm.models.credentials import CredentialBase as CredentialBase  # noqa: E402
 from litellm.models.credentials import CredentialItem as CredentialItem  # noqa: E402
+from litellm.models.credentials import UpdateCredentialItem as UpdateCredentialItem  # noqa: E402
 
 
 class ExtractedFileData(TypedDict):

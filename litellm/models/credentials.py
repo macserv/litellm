@@ -27,3 +27,10 @@ class CreateCredentialItem(CredentialBase):
         if not values.get("credential_values") and not values.get("model_id"):
             raise ValueError("Either credential_values or model_id must be set")
         return values
+
+
+class UpdateCredentialItem(BaseModel):
+    credential_name: str
+    credential_info: dict[str, object]
+    credential_values: dict[str, object] | None = None
+    model_id: str | None = None

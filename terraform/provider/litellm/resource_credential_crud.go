@@ -12,6 +12,12 @@ import (
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 )
 
+const (
+	endpointCredential               = "/credentials/%s"
+	endpointCredentialByName         = "/credentials/by_name/%s"
+	endpointCredentialByNameForModel = "/credentials/by_name/%s?model_id=%s"
+)
+
 // retryCredentialRead attempts to read a credential with exponential backoff.
 // If the read path clears the ID (e.g., transient 404 right after create),
 // we treat it as retryable instead of accepting an empty state.
@@ -72,10 +78,6 @@ func credentialRequestFromResource(d *schema.ResourceData, credentialName string
 	}
 }
 
-func credentialEndpoint(credentialName string) string {
-	return "/credentials/" + url.PathEscape(credentialName)
-}
-
 func resourceLiteLLMCredentialCreate(d *schema.ResourceData, m interface{}) error {
 	client := m.(*Client)
 	credentialName := d.Get("credential_name").(string)
@@ -129,9 +131,9 @@ func resourceLiteLLMCredentialRead(d *schema.ResourceData, m interface{}) error 
 	client := m.(*Client)
 	credentialName := d.Id()
 
-	endpoint := "/credentials/by_name/" + url.PathEscape(credentialName)
+	endpoint := fmt.Sprintf(endpointCredentialByName, url.PathEscape(credentialName))
 	if modelID := d.Get("model_id").(string); modelID != "" {
-		endpoint += "?model_id=" + url.QueryEscape(modelID)
+		endpoint = fmt.Sprintf(endpointCredentialByNameForModel, url.PathEscape(credentialName), url.QueryEscape(modelID))
 	}
 
 	resp, err := MakeRequest(client, "GET", endpoint, nil)
@@ -164,7 +166,7 @@ func resourceLiteLLMCredentialRead(d *schema.ResourceData, m interface{}) error 
 }
 
 func patchCredential(client *Client, d *schema.ResourceData, credentialName string) error {
-	resp, err := MakeRequest(client, "PATCH", credentialEndpoint(credentialName), credentialRequestFromResource(d, credentialName))
+	resp, err := MakeRequest(client, "PATCH", fmt.Sprintf(endpointCredential, url.PathEscape(credentialName)), credentialRequestFromResource(d, credentialName))
 	if err != nil {
 		return fmt.Errorf("failed to update credential: %w", err)
 	}
@@ -194,7 +196,7 @@ func resourceLiteLLMCredentialDelete(d *schema.ResourceData, m interface{}) erro
 	client := m.(*Client)
 	credentialName := d.Id()
 
-	resp, err := MakeRequest(client, "DELETE", credentialEndpoint(credentialName), nil)
+	resp, err := MakeRequest(client, "DELETE", fmt.Sprintf(endpointCredential, url.PathEscape(credentialName)), nil)
 	if err != nil {
 		return fmt.Errorf("failed to delete credential: %w", err)
 	}
